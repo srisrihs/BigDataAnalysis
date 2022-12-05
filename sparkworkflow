@@ -1,0 +1,901 @@
+import seaborn as sns
+sns.set()
+import xml.etree.ElementTree as ET
+from lxml import etree
+
+## Data input and parsing
+
+
+Some rows are split across multiple lines; these can be discarded. Incorrectly formatted XML can also be ignored. It is enough to simply skip problematic rows, the loss of data will not significantly impact our results on this large data sets.
+
+You will need to handle XML parsing yourself.  Our solution uses `lxml.etree` in Python.
+
+To make your code more flexible, it's also recommended to incorporate command-line arguments that specify the location of the input data and where output should be written.
+
+The goal should be to have a parsing function that can be applied to the input data to access any XML element desired. It is suggested to use a class structure so that you can create RDDs of Posts, Votes, Users, etc.
+
+``` python
+# Command line arguments using sysv or argparse in Python
+if __name__ == '__main__':
+    main(ARGS.input_dir, ARGS.output_dir)
+```
+
+from pyspark import SparkContext
+sc = SparkContext("local[*]", "temp")
+
+import os
+def localpath(path):
+    return 'file://' + str(os.path.abspath(os.path.curdir)) + '/' + path
+
+## Questions
+
+## Question 1: Bad XML
+
+
+A simple question to test your parsing code. Create an RDD of Post objects where each Post is a valid row of XML from the Cross-Validated (stats.stackexchange.com) `allPosts` data set.
+
+We are going to take several shortcuts to speed up and simplify our computations.  First, your parsing function should only attempt to parse rows that start with `<row` as these denote actual data entries. This should be done in Spark as the data is being read in from disk, without any pre-Spark processing. 
+
+Return the total number of XML rows that started with `<row` that were subsequently **rejected** during your processing.  Note that the text is unicode, and contains non-ASCII characters.  You may need to re-encode to UTF-8 (depending on your XML parser)
+
+Note that this cleaned data set will be used for all subsequent questions.
+
+*Question*: Can you figure out what filters you need to put in place to avoid throwing parsing errors entirely?
+
+!pwd
+
+import os
+def localpath(path):
+    return 'file://' + str(os.path.abspath(os.path.curdir)) + '/' + path
+
+!ls spark-stats-data/allPosts
+
+lines= sc.textFile(localpath('spark-stats-data/allPosts'))
+
+lines.take(3)
+
+line_xmls= lines.filter(lambda x: '<row' in x)
+line_xmls.count()
+
+def validParse(post):
+    try:
+        etree.fromstring(post)
+        return post
+    except:
+        return 0
+
+posts = line_xmls.map(validParse).filter(lambda x: x !=0)
+
+posts.take(3)
+
+pipe=posts.count()
+
+pipe
+
+import os
+def localpath(path):
+    return 'file://' + str(os.path.abspath(os.path.curdir)) + '/' + path
+
+posts = sc.textFile(localpath('/spark-stats-data/allPosts/'))
+totalLines = posts.count()
+line_xmls= posts.filter(lambda x: '<row' in x)
+
+def isInvalid(string):
+    try:
+        lxml.etree.fromstring(string)
+        return 1
+    except:
+        if '<row' in string:
+            return 1
+        else:
+            return 0
+count = posts.map(isInvalid) \
+    .reduce(lambda x, y: x+y) \
+
+pip= line_xmls.map(validParse).filter(lambda x: x !=0)
+pipe=pip.count()
+print('number of bad xmls=', count-pipe)
+
+bad_xml = count-pipe
+
+
+## Question 2: Favorites and scores
+
+We're interested in looking for useful patterns in the data.  If we look at the Post data again (the smaller set, `stats.stackexchange.com`), we see that many things about each post are recorded.  We're going to start by looking to see if there is a relationship between the number of times a post was favorited (the `FavoriteCount`) and the `Score`.  The score is the number of times the post was upvoted minus the number of times it was downvoted, so it is a measure of how much a post was liked.  We'd expect posts with a higher number of favorites to have better scores, since they're both measurements of how good the post is.
+
+Let's aggregate posts by the number of favorites, and find the average score for each number of favorites.  Do this for the lowest 50 numbers of favorites.
+
+If any field in the Posts or Users is missing, such as the `FavoriteCount`, you should assume it is zero. Make this assumption for all questions going forward.
+
+_Note:_ Before submitting, take a look at the numbers.  Do they follow the trend you expect?
+
+**Checkpoints**
+
+- Total score across all posts: 299469
+- Mean of first 50 favorite counts (averaging the keys themselves): 24.76
+
+posts = sc.textFile(localpath('spark-stats-data/allPosts/part-*.xml.gz'))
+totalLines = posts.count()
+votes = sc.textFile(localpath('spark-stats-data/allVotes/part-*.xml.gz'))
+totalLines = votes.count()
+
+posts.take(3)
+
+def getposts(string):
+    try:
+        row = etree.fromstring(string)
+        pid = row.attrib['PostId']
+        vid = row.attrib['VoteTypeId']
+        return (pid, vid)
+    except:
+        return None
+
+votes.map(getposts).take(5)
+
+def getvotes(string):
+    try:
+        lin = etree.fromstring(string)
+        score = lin.attrib['Score']
+        favr = lin.attrib['FavoriteCount']
+        return (int(favr),int(score))
+    except:
+        return None
+
+posts.map(getvotes).take(5)
+
+favorite_score=posts.map(getvotes).filter(lambda x: x is not None)\
+                    .sortByKey(lambda x: x[0]).reduceByKey(lambda x,y: x+y)\
+                    .join(posts.map(getvotes).filter(lambda x: x is not None).map(lambda x: x[0]).map(lambda x: (x,1))\
+                    .sortByKey(lambda x: x[0])\
+                    .reduceByKey(lambda x,y: x+y))\
+                    .map(lambda x: (x[0],x[1][0]/x[1][1])).collect()
+    
+favorite_score=sorted(list(favorite_score), key=lambda x: x[0])[:50]
+
+#favorite_score = [(0, 2.3398827696988396)]*50
+
+
+
+## Question 3: Answer percentage
+
+
+Investigate the correlation between a user's reputation and the kind of posts they make. For the 99 users with the highest reputation, single out posts which are either questions or answers and look at the percentage of these posts that are answers: *(answers / (answers + questions))*. 
+
+Return a tuple of their **user ID** and this fraction.
+
+You should also return (-1, fraction) to represent the case where you average over all users (so you will return 100 entries total).
+
+Again, you only need to run this on the statistics overflow set.
+
+
+#### Checkpoints
+
+* Total questions: 52,060
+* Total answers: 55,304
+* Top 99 users' average reputation: 11893.464646464647
+
+# since we need to investigate users!! we need Users, and posts data to investigagte
+!ls spark-stats-data/
+
+users = sc.textFile(localpath('spark-stats-data/allUsers/part-*.xml.gz'))
+users.take(5)
+
+class user_class(object):
+    def __init__(self, Id, Rep):
+        self.Id = Id
+        self.Rep = Rep
+
+class post_class(object):
+    def __init__(self, Id, ptid):
+        self.Id = Id
+        self.ptid = ptid
+
+def getusers(string):
+    try:
+        lin = etree.fromstring(string)
+        ids = lin.attrib['Id']
+        rep = lin.attrib['Reputation']
+        return user_class(ids, rep)
+    except:
+        return None
+
+def getposts(string):
+    try:
+        lin = etree.fromstring(string)
+        ptid = int(lin.attrib['PostTypeId'])
+        uid = lin.attrib['OwnerUserId']
+        return post_class(uid,ptid)
+    except:
+        return None
+
+def quesnans(lists):
+    u_id, types= lists
+    ques,ans,rep=0,0,0
+    for i in types:
+        if i[1] == 1:
+            ques +=1
+            rep= i[0]
+        elif i[1] == 2:
+            ans +=1
+            rep= i[0]
+    return (u_id, rep, (ans,ques))
+
+#XMLsyntaxError
+import xml.etree.ElementTree as ET   
+
+raw = sc.textFile(localpath('spark-stats-data/allPosts/*'))
+xmls=raw.filter(lambda x: '<row' in x)
+
+def parsePost(line):
+    try:
+        root = ET.fromstring(line)
+        return line
+    except:
+        return 0
+    
+posts = xmls.map(parsePost).filter(lambda x: x!= 0)
+
+
+##get reputation score
+def rep(line):
+    if '<row' in line:
+        try:
+            root = ET.fromstring(line)
+            if "Id" and "Reputation" in root.attrib:
+                uid = root.attrib['Id']
+                rep = root.attrib['Reputation']
+                return (uid,int(rep))
+            else:
+                return None
+        except:
+            return None
+    else:
+        return None
+    
+all_users=users.map(rep).filter(lambda x: x != None)
+
+##get post with questions and answers
+def post(line):
+    try:
+        root = ET.fromstring(line)
+        if "PostTypeId" and "OwnerUserId" in root.attrib:
+            uid = root.attrib['OwnerUserId']
+            ptype = int(root.attrib['PostTypeId'])
+            if ptype == 1 or ptype == 2:
+                return (uid,ptype)
+            else:
+                return None
+        else:
+            return None
+    except:
+        return None
+    
+all_p = posts.map(post).filter(lambda x: x != None)
+
+questions = all_p.filter(lambda x: x[1] == 1).reduceByKey(lambda x,y: x+y)
+
+answers = all_p.filter(lambda x: x[1] == 2).reduceByKey(lambda x,y: x+y).map(lambda x: (x[0],int(x[1]/2)))
+
+##merge 
+answer_percentage=all_users.join(questions).join(answers)\
+                                .map(lambda x: (int(x[0]),x[1][0][0],x[1][0][1],x[1][1]))\
+                                .map(lambda x: (x[0],x[1],x[3]/(x[2]+x[3]))).takeOrdered(99,lambda x: -x[1])
+                                
+answer_percentage_all=[(x[0],x[2]) for x in answer_percentage]
+
+
+avg = (-1,55304.0/(55304+52060))
+answer_percentage_all.append(avg)
+
+answer_percentage_all
+
+def values2KeyVal(x):
+    return (x[1][0],x[1][1])
+
+answer_percentage_long=all_users.join(questions).join(answers)\
+                                .map(lambda x: (int(x[0]),x[1][0][0],x[1][0][1],x[1][1]))
+
+answer_percentage_long.map(lambda x: (x[0],x[3]/(x[2]+x[3]),1)).take(3)
+
+all_users.join(questions).join(answers).take(3)
+
+all_users.join(questions).join(answers).map(lambda x: (int(x[0]),x[1][0][0],x[1][0][1],x[1][1])).take(3)
+
+all_users.join(questions).join(answers).map(lambda x: (int(x[0]),x[1][0][0],x[1][0][1],x[1][1])).map(lambda x: (x[0],x[1],x[3])).take(3)
+
+all_p.filter(lambda x: x[1] == 2).reduceByKey(lambda x,y: x+y).map(lambda x: (x[0],int(x[1]/2))).take(3)
+
+
+
+
+
+
+
+## Question 4: First question
+
+We'd expect the first **question** a user asks to be indicative of their future behavior.  We'll dig more into that in the next problem, but for now let's see the relationship between reputation and how long it took each person to ask their first question.
+
+For each user that asked a question, find the difference between when their account was created (`CreationDate` for the User) and when they asked their first question (`CreationDate` for their first question).  Return this time difference in days (round down, so 2.7 days counts as 2 days) for the 100 users with the highest reputation, in the form
+
+`(UserId, Days)`
+
+**Checkpoints**
+- Users that asked a question: 23134
+- Average number of days (round each user's days, then average): 30.1074258
+
+posts = sc.textFile(localpath('spark-stats-data/allPosts/part-*.xml.gz'))
+totalLines = posts.count()
+
+posts.take(3)
+
+users = sc.textFile(localpath('spark-stats-data/allUsers/part-*.xml.gz'))
+
+users.take(5)
+
+def findcreationdate(line):
+
+    try:
+        lin = etree.fromstring(line)
+
+        uid = lin.attrib['Id']
+        rep = lin.attrib['Reputation']
+        pdate = lin.attrib['CreationDate']
+        return (uid,rep,pdate)
+
+    except:
+        return 0
+
+
+users.map(findcreationdate).filter(lambda x: x!=0).take(10)
+
+#parse date and time
+from datetime import timedelta,datetime
+def timecast(date):
+    if date == 0:
+        return 0
+    else:
+        return datetime.strptime(date,'%Y-%m-%dT%H:%M:%S.%f')
+
+timecast('2010-07-19T06:55:26.860')
+
+users_details= users.map(findcreationdate).filter(lambda x: x!=0).map(lambda x: (x[0], (x[1], timecast(x[2]))))
+users_details.take(3)
+
+def postfirstquestion(line):
+
+    try:
+        lin = etree.fromstring(line)
+
+        uid = lin.attrib['OwnerUserId']
+        ptype = lin.attrib['PostTypeId']
+        pdate = lin.attrib['CreationDate']
+        if ptype=='1':
+            return (uid,pdate)
+        else:
+            return 0
+
+    except:
+        return 0
+
+posts.map(postfirstquestion).filter(lambda x: x!=0).take(10)
+
+post_details=posts.map(postfirstquestion).filter(lambda x: x!=0).map(lambda x: (x[0], timecast(x[1])))\
+.reduceByKey(lambda x,y: min(x,y))
+
+post_details.take(3)
+
+def timetofirstpost(x,y):
+    if x==0 or y==0:
+        return 0
+    else:
+        return (x-y).days
+
+users_details.join(post_details).map(lambda x: (x[0],x[1][0][0],x[1][0][1],x[1][1])).take(3)
+
+detailstuple= users_details.join(post_details).map(lambda x: (x[0],x[1][0][0],x[1][0][1],x[1][1]))
+
+detailstuple.take(5)
+
+first_question=detailstuple.map(lambda x:(x[0],int(x[1]),timetofirstpost(x[3],x[2]))).takeOrdered(100,key= lambda x: -x[1])
+
+first_question
+
+first_question=sorted(list(first_question),key=lambda x:-x[1])[:100]
+
+first_question
+
+first_questions=[(int(x[0]),x[2]) for x in first_question]
+
+first_questions
+
+
+
+
+
+## Question 5: Identify veterans
+
+
+It can be interesting to think about what factors influence a user to remain active on the site over a long period of time. In order not to bias the results towards older users, we'll define a time window between 100 and 150 days after account creation. If the user has made a post in this time, we'll consider them active and well on their way to being veterans of the site; if not, they are inactive and were likely brief users.
+
+*Consider*: What other parameterizations of "activity" could we use, and how would they differ in terms of splitting our user base?
+
+*Consider*: What other biases are still not dealt with, after using the above approach?
+
+Let's see if there are differences between the first ever question posts of "veterans" vs. "brief users". For each group separately, average the score, views, number of answers, and number of favorites of the users' **first question**. Remember, if the score, views, answers, or favorites is missing, you should assume it is zero.
+
+*Consider*: What story could you tell from these numbers? How do the numbers support it?
+
+
+#### Checkpoints
+
+* Total brief users: 24,864
+* Total veteran users: 2,027
+
+def time_delta(x,y):
+    if x is None or y is None:
+        return None
+    else:
+        return (x-y).days
+
+posts = sc.textFile(localpath('spark-stats-data/allPosts'))
+users = sc.textFile(localpath('spark-stats-data/allUsers'))
+
+! ls spark-stats-data
+
+#parse date and time
+from datetime import timedelta,datetime
+def timecast(date):
+    if date == 0:
+        return 0
+    else:
+        return datetime.strptime(date,'%Y-%m-%dT%H:%M:%S.%f')
+
+def timetofirstpost(x,y):
+    if x is None or y is None:
+        return None
+    else:
+        return (x-y).days
+
+def searchingusers(line):
+
+    try:
+        lin = etree.fromstring(line)
+
+        uid = lin.attrib['Id']
+        pdate = lin.attrib['CreationDate']
+        return (uid,pdate)
+
+    except:
+        return 0
+
+def searchingposts(line):
+
+    try:
+        lin = etree.fromstring(line)
+
+        uid = lin.attrib['OwnerUserId']
+        pdate = lin.attrib['CreationDate']
+        
+        return (uid,pdate)
+       
+
+    except:
+        return 0    
+
+def searchingveteranuser(line):
+    if line==0:
+        return 0
+    if int(line) >=100 and int(line) <=150:
+        return 1
+    else:
+        return 0
+
+users.map(searchingusers).filter(lambda x: x!=0).take(3)
+
+V_users=users.map(searchingusers).filter(lambda x: x!=0).map(lambda x: (x[0],timecast(x[1])))
+
+posts.map(searchingposts).filter(lambda x: x!=0).map(lambda x: (x[0], timecast(x[1]))).take(3)
+
+V_posts=posts.map(searchingposts).filter(lambda x: x!=0).map(lambda x: (x[0], timecast(x[1])))
+
+V_users.join(V_posts).map(lambda x: (x[0], timeoffirstpost(x[1][1],x[1][0])))
+
+V_users_Vposts=V_users.join(V_posts).map(lambda x: (x[0], time_delta(x[1][1],x[1][0])))
+
+V_users_Vposts.map(lambda x: (x[0],searchingveteranuser(x[1]))).take(3)
+
+V_users_Vposts=V_users.join(V_posts).map(lambda x: (x[0], time_delta(x[1][1],x[1][0])))\
+.map(lambda x: (x[0],searchingveteranuser(x[1]))).reduceByKey(lambda x,y: max(x,y))
+
+V_users_Vposts.take(10)
+
+V_veterans=V_users_Vposts.filter(lambda x: x[1]==1)
+
+V_veterans.take(3)
+
+V_briefs=V_users_Vposts.filter(lambda x: x[1]==0)
+
+def usersactivity_details():
+    try:
+        lin = etree.fromstring(line)
+        uid = lin.attrib['OwnerUserId']
+        ptype = lin.attrib['PostTypeId']
+        pdate = lin.attrib['CreationDate']
+        answer = root.attrib["AnswerCount"]         
+        view = root.attrib["ViewCount"]          
+        fav = root.attrib["FavoriteCount"]         
+        sr = root.attrib["Score" ]
+        if ptype=='1':
+            return (uid,pdate,int(answer),int(view),int(fav),int(sr))
+        else:
+            return 0
+    except:
+        return 0
+
+
+
+identify_veterans = {
+    "vet_score": 0,
+    "vet_views": 0,
+    "vet_answers": 0,
+    "vet_favorites": 0,
+    "brief_score": 0,
+    "brief_views": 0,
+    "brief_answers": 0,
+    "brief_favorites": 0
+}
+
+
+## Question 6: Identify veterans&mdash;full
+
+
+Same as above, but on the full Stack Exchange data set.
+
+No pre-parsed data is available for this question.
+
+
+#### Checkpoints
+
+* Total brief users: 1,848,628
+* Total veteran users: 288,285
+
+
+
+
+
+
+
+
+
+
+
+identify_veterans_full = {
+    "vet_score":2.156145241083955,
+    "vet_views":1801.041589751163,
+    "vet_answers": 1.8337194491619286,
+    "vet_favorites": 0.8651969652218858,
+    "brief_score": 1.1947695334768675,
+    "brief_views": 1095.1468872554271,
+    "brief_answers": 1.5033659787554736,
+    "brief_favorites":0.0.3854817164205759
+    }
+
+
+
+## Question 7: Word2vec
+
+
+Word2Vec is an alternative approach for vectorizing text data. The vectorized representations of words in the vocabulary tend to be useful for predicting other words in the document, hence the famous example "vector('king') - vector('man') + vector('woman') ~= vector('queen')".
+
+Let's see how good a Word2Vec model we can train using the **tags** of each Stack Exchange post as documents (this uses the full data set). Use the implementation of Word2Vec from Spark ML (this will require using DataFrames) to return a list of the top 25 closest synonyms to "ggplot2" and their similarity score in tuple format ("string", number).
+
+The tags appear in the data as one string, you will need to separate them into individual tags. There is no need to further parse them beyond separating them.
+
+#### Parameters
+
+
+The dimensionality of the vector space should be 100. The random seed should be 42 in `PySpark`.
+
+
+#### Checkpoints
+
+* Mean of the top 25 cosine similarities: 0.8012362027168274
+
+from pyspark.ml.feature import Word2Vec
+from pyspark import SparkContext, SparkConf
+from pyspark.sql import SparkSession
+import re
+
+sc.stop()
+
+from pyspark.ml.feature import Word2Vec
+from pyspark import SparkContext, SparkConf
+from pyspark.sql import SparkSession
+import re
+
+sc = SparkContext("local[*]", "temp")
+spark = SparkSession(sc) 
+from pyspark.sql import SQLContext
+
+sqlContext = SQLContext(sc)
+
+posts = sc.textFile(localpath('spark-stack-data/allPosts'))
+
+from lxml import etree
+from lxml.etree import XMLSyntaxError
+def gettags(line):
+    if '<row' in line  and '/>' in line:
+        try:
+            lin= etree.fromstring(line)
+            if "Tags" in lin.attrib:
+                
+                tags=lin.attrib['Tags']
+                tags = tags[1:-1].split('><')
+                return tags
+            else:
+                return None
+        except XMLSyntaxError:
+            return None
+    else:
+        return None
+
+postss=posts.map(gettags).filter(lambda x:x is not None)
+
+from pyspark.mllib.feature import Word2Vec
+word2vec=Word2Vec().setVectorSize(100).setSeed(42)
+
+word_model=word2vec.fit(posts.map(gettags).filter(lambda x:x is not None))
+
+synonyms=word_model.findSynonyms('ggplot2', 25)
+list(synonyms)
+
+def tag_post(line):
+    if '<row' in line:
+        try:
+            root = etree.fromstring(line)
+            if "Tags" in root.attrib:
+                tag = root.attrib['Tags']
+                return tag
+            else:
+                return ('Empty')
+        except XMLSyntaxError:
+            return ('Empty')
+    else:
+        return ('Empty')
+
+tag_posts = posts.map(tag_post).filter(lambda x: x!= 'Empty')
+
+df=tag_posts.map(lambda line: ([s for s in re.split("<|>", line) if s != ''], 1))\
+            .toDF(['text', 'score'])
+
+w2v = Word2Vec(inputCol="text", outputCol="vectors", vectorSize=100,minCount=10,seed=17)
+model = w2v.fit(df)
+result = model.transform(df)
+
+model.findSynonyms('ggplot2', 25).rdd.take(25)
+
+model.findSynonyms('ggplot2', 25).rdd.take(25)[0]['word'],model.findSynonyms('ggplot2', 25).rdd.take(25)[0]['similarity']
+
+lis = model.findSynonyms('ggplot2', 25).rdd.take(25)
+word2vec = [(l['word'],l['similarity']) for l in lis]
+word2vec
+
+w2v = Word2Vec(inputCol="text", outputCol="vectors",minCount=10, vectorSize=100,seed=17)
+model = w2v.fit(df)
+result = model.transform(df)
+
+result.show(10)
+
+model.findSynonyms('ggplot2', 25).show(25)
+
+dict(model.findSynonyms('ggplot2', 25))
+
+
+
+## Question 8: Classification
+
+
+
+
+
+- Number of training posts with a tag in the top 10: `22525`
+- Number without: `19540`
+
+import re
+
+!unzip -d spark-stats-data/train spark-stats-data/posts_train.zip
+!unzip -d spark-stats-data/test spark-stats-data/posts_test.zip
+
+train = sc.textFile(localpath('spark-stats-data/train'))
+
+def token_tag(string):
+    tokens= [s for s in re.split("<|>", string) if s != '']
+    token_count=[(t,1) for t in tokens]
+    return token_count
+
+def tag_post(line):
+    if '<row' in line:
+        try:
+            root = etree.fromstring(line)
+            if "Tags" in root.attrib:
+                tag = root.attrib['Tags']
+                return tag
+            else:
+                return ('Empty')
+        except XMLSyntaxError:
+            return ('Empty')
+    else:
+        return ('Empty')
+
+common_tags = train.map(tag_post).filter(lambda x: x != 'Empty')\
+                   .flatMap(token_tag).reduceByKey(lambda x,y: x+y)\
+                   .takeOrdered(10, key=lambda x: -x[1])
+
+tags = [t[0] for t in common_tags]
+tags
+
+def format_body(string):
+    p = re.compile('<p>(.+)</p>')
+    lis = p.findall(string)
+    return ''.join(p.findall(string))
+
+def token_check(string):
+    tokens= [s for s in re.split("<|>", string) if s != '']
+    for t in tags:
+        if t in tokens:
+            return 1
+    else:
+        return 0
+
+string ='<regression><tag>'
+token_check(string)
+
+p = re.compile('<p>(.+)</p>')
+
+p = re.compile('>(.+)<')
+
+string = '<p>Last year, I read a blog post from <a href="http://anyall.org/">Brendan O\'Connor</a> entitled <a href="http://anyall.org/blog/2008/12/statistics-vs-machine-learning-fight/">"Statistics vs. Machine Learning, fight!"</a> that discussed some of the differences between the two fields.  <a href="http://andrewgelman.com/2008/12/machine_learnin/">Andrew Gelman responded favorably to this</a>:</p>\n\n<p>Simon Blomberg: </p>\n\n<blockquote>\n  <p>From R\'s fortunes\n  package: To paraphrase provocatively,\n  \'machine learning is statistics minus\n  any checking of models and\n  assumptions\'.\n  -- Brian D. Ripley (about the difference between machine learning\n  and statistics) useR! 2004, Vienna\n  (May 2004) :-) Season\'s Greetings!</p>\n</blockquote>\n\n<p>Andrew Gelman:</p>\n\n<blockquote>\n  <p>In that case, maybe we should get rid\n  of checking of models and assumptions\n  more often. Then maybe we\'d be able to\n  solve some of the problems that the\n  machine learning people can solve but\n  we can\'t!</p>\n</blockquote>\n\n<p>There was also the <a href="http://projecteuclid.org/euclid.ss/1009213726"><strong>"Statistical Modeling: The Two Cultures"</strong> paper</a> by Leo Breiman in 2001 which argued that statisticians rely too heavily on data modeling, and that machine learning techniques are making progress by instead relying on the <em>predictive accuracy</em> of models.</p>\n\n<p>Has the statistics field changed over the last decade in response to these critiques?  Do the <em>two cultures</em> still exist or has statistics grown to embrace machine learning techniques such as neural networks and support vector machines?</p>\n'
+''.join(p.findall(string))
+
+def tag_post(line):
+    if '<row' in line:
+        try:
+            root = etree.fromstring(line)
+            if 'Body' and "Tags" in root.attrib:
+                body = root.attrib['Body']
+                tag = root.attrib['Tags']
+                return (body,token_check(tag))
+            else:
+                return ('Empty')
+        except XMLSyntaxError:
+            return ('Empty')
+    else:
+        return ('Empty')
+
+train.map(tag_post).filter(lambda x: x != 'Empty').take(5)
+
+train_set = train.map(tag_post).filter(lambda x: x != 'Empty').collect()
+
+train.map(tag_post).filter(lambda x: x != 'Empty').filter(lambda x: x[1]==0).count()
+
+from pyspark.ml.classification import LogisticRegression
+from pyspark.sql import SQLContext
+from pyspark.ml.classification import RandomForestClassifier
+sqlContext = SQLContext(sc)
+from pyspark.ml.feature import HashingTF, Tokenizer,RegexTokenizer
+##save the computation from the traing process by cache()
+training = sqlContext.createDataFrame(train_set, ["title", "label"]).cache()
+
+training.show()
+
+logreg = LogisticRegression(maxIter=1000000, regParam=0.8)
+
+logreg
+
+from pyspark.ml.feature import StopWordsRemover
+from pyspark.ml import Pipeline
+
+
+from sklearn.base import TransformerMixin
+tokenizer = RegexTokenizer(inputCol="title", outputCol="words", pattern="\\w")
+tokenizer = Tokenizer(inputCol="title", outputCol="words")
+remover = StopWordsRemover(inputCol=tokenizer.getOutputCol(), outputCol="filtered")
+
+hashingTF = HashingTF(inputCol=remover.getOutputCol(), outputCol="features")
+logreg = LogisticRegression(maxIter=1000000, regParam=0.8)
+
+pipeline = Pipeline(stages=[tokenizer,remover, hashingTF, logreg])
+
+from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
+from pyspark.ml.evaluation import BinaryClassificationEvaluator
+
+
+paramGrid = (ParamGridBuilder() 
+    .addGrid(hashingTF.numFeatures, [2000])
+    .addGrid(logreg.regParam, [10, 1, 0.1]) 
+    .build())
+
+crossval = CrossValidator(estimator=pipeline,
+                          estimatorParamMaps=paramGrid,
+                          evaluator=BinaryClassificationEvaluator(),
+                          numFolds=5)
+
+tokenizer
+
+tokenizer = Tokenizer(inputCol="title", outputCol="words")
+
+remover = StopWordsRemover(inputCol=tokenizer.getOutputCol(), outputCol="filtered")
+
+hashingTF = HashingTF(inputCol=remover.getOutputCol(), outputCol="features")
+
+logreg = LogisticRegression(maxIter=1000000, regParam=0.8)
+
+pipeline = Pipeline(stages=[tokenizer,remover, hashingTF, logreg])
+
+from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
+from pyspark.ml.evaluation import BinaryClassificationEvaluator
+
+
+paramGrid = (ParamGridBuilder() 
+    .addGrid(hashingTF.numFeatures, [2000])
+    .addGrid(logreg.regParam, [10, 1, 0.1]) 
+    .build())
+
+crossval = CrossValidator(estimator=pipeline,
+                          estimatorParamMaps=paramGrid,
+                          evaluator=BinaryClassificationEvaluator(),
+                          numFolds=5)
+
+cvModel = crossval.fit(training)
+
+best_model = cvModel.bestModel
+
+test = sc.textFile(localpath('spark-stats-data/test'))
+
+def tag_post_test(line):
+    if '<row' in line:
+        try:
+            root = etree.fromstring(line)
+            if 'Body' and 'Id' and "PostTypeId" in root.attrib:
+                if int(root.attrib['PostTypeId']) == 1:
+                    pid = root.attrib['Id']
+                    body = root.attrib['Body']
+                    return (body, int(pid))
+                else:
+                    return ('Empty') 
+            else:
+                return ('Empty')
+        except XMLSyntaxError:
+            return ('Empty')
+    else:
+        return ('Empty')
+
+test.map(tag_post_test).filter(lambda x: x != 'Empty').count()
+
+test_set = test.map(tag_post_test).filter(lambda x: x != 'Empty')
+
+test_df = sqlContext.createDataFrame(test_set, ["title", "id"])
+
+test_df.show()
+
+better_prediction = cvModel.transform(test_df)
+
+better_prediction.show()
+
+selected = better_prediction.select("id", "prediction")
+
+for row in selected.collect()[5]:
+    print(row)
+
+sort_selected = selected.sort("id").collect()
+sort_selected
+
+predictions = [int(x['prediction']) for x in sort_selected]
+len(predictions)
+
+
+
+
+
+
+
